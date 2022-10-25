@@ -23,7 +23,8 @@
 
 // define this to use asio standalone and beast standalone, otherwise use boost::asio and boost::beast.
 #define ASIO2_HEADER_ONLY
-
+#define AUTO_CONFIG_CONV
+#define USE_KCP_FEC
 // If you want to use the ssl, you need to define ASIO2_USE_SSL.
 // When use ssl,on windows need linker "libssl.lib;libcrypto.lib;Crypt32.lib;", on 
 // linux need linker "ssl;crypto;", if link failed under gcc, try ":libssl.a;:libcrypto.a;"

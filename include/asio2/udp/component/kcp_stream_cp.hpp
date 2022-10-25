@@ -26,6 +26,10 @@
 #include <asio2/base/detail/buffer_wrap.hpp>
 
 #include <asio2/udp/detail/kcp_util.hpp>
+#ifdef USE_KCP_FEC
+#include "fec.h"
+#include "encoding.h"
+#endif
 
 namespace asio2::detail
 {
@@ -88,7 +92,12 @@ namespace asio2::detail
 			} old_kcp_destructor_guard(old);
 
 			ASIO2_ASSERT(conv != 0);
-
+#ifdef USE_KCP_FEC
+            this->dataShards=3;
+            this->parityShards=1;
+            this->shards.resize(dataShards + parityShards, nullptr);
+            this->fec = FEC::New(3 * (dataShards + parityShards), dataShards, parityShards);
+#endif
 			this->kcp_ = kcp::ikcp_create(conv, (void*)this);
 			this->kcp_->output = &kcp_stream_cp<derived_t, args_t>::_kcp_output;
 
@@ -122,9 +131,11 @@ namespace asio2::detail
 		{
 			error_code ec_ignore{};
 
-			// if is kcp mode, send FIN handshake before close
+#ifndef USE_KCP_FEC
+            // if is kcp mode, send FIN handshake before close
 			if (this->send_fin_)
 				this->_kcp_send_hdr(kcp::make_kcphdr_fin(0), ec_ignore);
+#endif
 
 			try
 			{
@@ -136,6 +147,7 @@ namespace asio2::detail
 		}
 
 	protected:
+#ifndef USE_KCP_FEC
 		inline std::size_t _kcp_send_hdr(kcp::kcphdr hdr, error_code& ec)
 		{
 			std::string msg = kcp::to_string(hdr);
@@ -159,7 +171,7 @@ namespace asio2::detail
 			kcp::kcphdr synack = kcp::make_kcphdr_synack(syn.th_ack, syn.th_seq);
 			return this->_kcp_send_hdr(synack, ec);
 		}
-
+#endif
 		template<class Data, class Callback>
 		inline bool _kcp_send(Data& data, Callback&& callback)
 		{
@@ -215,41 +227,80 @@ namespace asio2::detail
 				this->_post_kcp_timer(std::move(this_ptr));
 		}
 
+        template<class buffer_t, typename MatchCondition>
+        inline void _do_kcp_recv(std::shared_ptr<derived_t>& this_ptr, std::string_view data, buffer_t& buffer,
+                              condition_wrap<MatchCondition>& condition){
+            int len = kcp::ikcp_input(this->kcp_, (const char *)data.data(), (long)data.size());
+            buffer.consume(buffer.size());
+            if (len != 0)
+            {
+                set_last_error(asio::error::message_size);
+                if (derive.state() == state_t::started)
+                {
+                    derive._do_disconnect(asio::error::message_size, this_ptr);
+                }
+                return;
+            }
+            for (;;)
+            {
+                len = kcp::ikcp_recv(this->kcp_, (char *)buffer.prepare(
+                        buffer.pre_size()).data(), (int)buffer.pre_size());
+                if /**/ (len >= 0)
+                {
+                    buffer.commit(len);
+                    derive._fire_recv(this_ptr, std::string_view(static_cast
+                                                                         <std::string_view::const_pointer>(buffer.data().data()), len), condition);
+                    buffer.consume(len);
+                }
+                else if (len == -3)
+                {
+                    buffer.pre_size(buffer.pre_size() * 2);
+                }
+                else break;
+            }
+            kcp::ikcp_flush(this->kcp_);
+        }
+
 		template<class buffer_t, typename MatchCondition>
 		inline void _kcp_recv(std::shared_ptr<derived_t>& this_ptr, std::string_view data, buffer_t& buffer,
 			condition_wrap<MatchCondition>& condition)
 		{
-			int len = kcp::ikcp_input(this->kcp_, (const char *)data.data(), (long)data.size());
-			buffer.consume(buffer.size());
-			if (len != 0)
-			{
-				set_last_error(asio::error::message_size);
-				if (derive.state() == state_t::started)
-				{
-					derive._do_disconnect(asio::error::message_size, this_ptr);
-				}
-				return;
-			}
-			for (;;)
-			{
-				len = kcp::ikcp_recv(this->kcp_, (char *)buffer.prepare(
-					buffer.pre_size()).data(), (int)buffer.pre_size());
-				if /**/ (len >= 0)
-				{
-					buffer.commit(len);
-					derive._fire_recv(this_ptr, std::string_view(static_cast
-						<std::string_view::const_pointer>(buffer.data().data()), len), condition);
-					buffer.consume(len);
-				}
-				else if (len == -3)
-				{
-					buffer.pre_size(buffer.pre_size() * 2);
-				}
-				else break;
-			}
-			kcp::ikcp_flush(this->kcp_);
-		}
+#ifdef USE_KCP_FEC
+            // decode FEC packet
+            auto pkt = fec.Decode((byte *) data.data(), static_cast<size_t>(data.size()));
+            if (pkt.flag == typeData) {
+                auto ptr = pkt.data->data();
 
+                std::string_view sv((char *) (ptr + 2),pkt.data->size() - 2);
+                _do_kcp_recv(this_ptr,sv,buffer,condition);
+            }
+
+            // allow FEC packet processing with correct flags.
+            if (pkt.flag == typeData || pkt.flag == typeFEC) {
+                // input to FEC, and see if we can recover data.
+                auto recovered = fec.Input(pkt);
+                // we have some data recovered.
+                for (auto &r : recovered) {
+                    // recovered data has at least 2B size.
+                    if (r->size() > 2) {
+                        auto ptr = r->data();
+                        // decode packet size, which is also recovered.
+                        uint16_t sz;
+                        decode16u(ptr, &sz);
+                        // the recovered packet size must be in the correct range.
+                        if (sz >= 2 && sz <= r->size()) {
+                            std::string_view sv((char *) (ptr + 2),sz - 2);
+                            _do_kcp_recv(this_ptr,sv,buffer,condition);
+
+                        }
+                    }
+                }
+            }
+#else
+            _do_kcp_recv(this_ptr,data,buffer,condition);
+#endif
+		}
+#ifndef AUTO_CONFIG_CONV
 		template<typename MatchCondition, typename DeferEvent>
 		inline void _post_handshake(
 			std::shared_ptr<derived_t> self_ptr, condition_wrap<MatchCondition> condition, DeferEvent chain)
@@ -379,7 +430,16 @@ namespace asio2::detail
 				}
 			}
 		}
-
+#else
+        template<typename MatchCondition, typename DeferEvent>
+        inline void _post_handshake(
+                std::shared_ptr<derived_t> self_ptr, condition_wrap<MatchCondition> condition, DeferEvent chain)
+        {
+            error_code ec;
+            this->_kcp_start(self_ptr, derive.kcp_conv_);
+            this->_handle_handshake(ec, std::move(self_ptr), std::move(condition), std::move(chain));
+        }
+#endif
 		template<typename MatchCondition, typename DeferEvent>
 		inline void _handle_handshake(const error_code & ec, std::shared_ptr<derived_t> this_ptr,
 			condition_wrap<MatchCondition> condition, DeferEvent chain)
@@ -413,7 +473,54 @@ namespace asio2::detail
 
 		static int _kcp_output(const char *buf, int len, kcp::ikcpcb *kcp, void *user)
 		{
-			std::ignore = kcp;
+#ifdef USE_KCP_FEC
+            auto t = (kcp_stream_cp*)user;
+            derived_t & derive = t->derive;
+            error_code ec;
+
+            // append FEC header
+            // extend to len + fecHeaderSizePlus2
+            // i.e. 4B seqid + 2B flag + 2B size
+            memcpy(t->m_buf + fecHeaderSizePlus2, buf, static_cast<size_t>(len));
+            t->fec.MarkData(t->m_buf, static_cast<uint16_t>(len));
+
+
+
+            if constexpr (args_t::is_session)
+                derive.stream().send_to(asio::buffer(t->m_buf, len + fecHeaderSizePlus2),
+                                        derive.remote_endpoint_, 0, ec);
+            else
+                derive.stream().send(asio::buffer(t->m_buf, len + fecHeaderSizePlus2), 0, ec);
+
+
+            // FEC calculation
+            // copy "2B size + data" to shards
+            auto slen = len + 2;
+            t->shards[t->pkt_idx] = std::make_shared<std::vector<byte>>(&t->m_buf[fecHeaderSize], &t->m_buf[fecHeaderSize + slen]);
+
+            // count number of data shards
+            t->pkt_idx++;
+            if (t->pkt_idx == t->dataShards) { // we've collected enough data shards
+                t->fec.Encode(t->shards);
+                // send parity shards
+                for (size_t i = t->dataShards; i < t->dataShards + t->parityShards; i++) {
+                    // append header to parity shards
+                    // i.e. fecHeaderSize + data(2B size included)
+                    memcpy(t->m_buf + fecHeaderSize, t->shards[i]->data(), t->shards[i]->size());
+                    t->fec.MarkFEC(t->m_buf);
+
+                    if constexpr (args_t::is_session)
+                        derive.stream().send_to(asio::buffer(t->m_buf, t->shards[i]->size() + fecHeaderSize),
+                                                derive.remote_endpoint_, 0, ec);
+                    else
+                        derive.stream().send(asio::buffer(t->m_buf, t->shards[i]->size() + fecHeaderSize), 0, ec);
+
+                }
+                // reset indexing
+                t->pkt_idx = 0;
+            }
+#else
+            std::ignore = kcp;
 
 			kcp_stream_cp * zhis = ((kcp_stream_cp*)user);
 
@@ -425,6 +532,8 @@ namespace asio2::detail
 					derive.remote_endpoint_, 0, ec);
 			else
 				derive.stream().send(asio::buffer(buf, len), 0, ec);
+#endif
+
 
 			return 0;
 		}
@@ -433,7 +542,14 @@ namespace asio2::detail
 		derived_t                   & derive;
 
 		kcp::ikcpcb                 * kcp_ = nullptr;
-
+#ifdef USE_KCP_FEC
+        FEC                          fec;
+        uint32_t pkt_idx{0};
+        std::vector<row_type> shards;
+        size_t dataShards{0};
+        size_t parityShards{0};
+        byte m_buf[2048];
+#endif
 		bool                          send_fin_ = true;
 
 		handler_memory<>              tallocator_;

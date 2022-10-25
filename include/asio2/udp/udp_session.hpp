@@ -241,6 +241,7 @@ namespace asio2::detail
 
 			if constexpr (std::is_same_v<typename condition_wrap<MatchCondition>::condition_type, use_kcp_t>)
 			{
+#ifndef AUTO_CONFIG_CONV
 				// step 3 : server recvd syn from client (the first_ is syn)
 				// Check whether the first_ packet is SYN handshake
 				if (!kcp::is_kcphdr_syn(this->first_))
@@ -251,6 +252,7 @@ namespace asio2::detail
 						std::move(this_ptr), std::move(chain));
 					return;
 				}
+#endif
 				this->kcp_ = std::make_unique<kcp_stream_cp<derived_t, args_t>>(this->derived(), this->io_);
 				this->kcp_->_post_handshake(std::move(this_ptr), std::move(condition), std::move(chain));
 			}
@@ -439,14 +441,17 @@ namespace asio2::detail
 			}
 			else
 			{
-				// the kcp message header length is 24
-				// the kcphdr length is 12 
+#ifdef AUTO_CONFIG_CONV
+                this->kcp_->_kcp_recv(this_ptr, data, this->buffer_ref_, condition);
+#else
+                // the kcp message header length is 24
+				// the kcphdr length is 12
 				if (data.size() == kcp::kcphdr::required_size())
 				{
 					// Check whether the packet is SYN handshake
 					// It is possible that the client did not receive the synack package, then the client
 					// will resend the syn package, so we just need to reply to the syncack package directly.
-					// If the client is disconnect without send a "fin" or the server has't recvd the 
+					// If the client is disconnect without send a "fin" or the server has't recvd the
 					// "fin", and then the client connect again a later, at this time, the client
 					// is in the session map already, and we need check whether the first message is fin
 					if /**/ (kcp::is_kcphdr_syn(data))
@@ -501,6 +506,8 @@ namespace asio2::detail
 				{
 					this->kcp_->_kcp_recv(this_ptr, data, this->buffer_ref_, condition);
 				}
+#endif
+
 			}
 		}
 
